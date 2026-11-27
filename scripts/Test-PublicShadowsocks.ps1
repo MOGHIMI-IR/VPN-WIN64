@@ -134,12 +134,15 @@ foreach ($candidate in $candidates) {
         if (-not $listening) { throw 'local proxy listener did not start' }
 
         $probe = & curl.exe --silent --show-error --fail --proxy "http://127.0.0.1:$proxyPort" --connect-timeout 6 --max-time 14 'https://www.cloudflare.com/cdn-cgi/trace' 2>&1
-        if ($LASTEXITCODE -ne 0 -or ($probe -notmatch '(^|\n)ip=')) {
-            $detail = (($probe | Out-String).Trim())
+        $curlExitCode = $LASTEXITCODE
+        $probeText = @($probe) -join "`n"
+        $hasCloudflareIp = $probeText -match '(?m)^ip=\S+'
+        if ($curlExitCode -ne 0 -or -not $hasCloudflareIp) {
+            $detail = "HTTPS probe failed (curl exit code $curlExitCode; Cloudflare IP marker: $hasCloudflareIp)"
             throw 'HTTPS connectivity probe through this proxy failed'
         }
         $status = 'passed'
-        $detail = 'HTTPS request reached the external probe through sing-box'
+        $detail = 'HTTPS request successfully passed through sing-box and returned a Cloudflare trace.'
         $passedConfigs.Add([pscustomobject]@{
             title = $candidate.Label
             config_text = $candidate.Uri
