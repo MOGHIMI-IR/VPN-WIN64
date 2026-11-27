@@ -1,0 +1,1 @@
+The CI workflow downloads the official sing-box Windows x64 release (SHA-256 pinned in the workflow) and the Vazirmatn font (SIL Open Font License) before building. These binaries/font are intentionally not committed to the source tree.

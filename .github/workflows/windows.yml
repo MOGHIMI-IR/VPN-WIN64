@@ -1,0 +1,153 @@
+name: MIX-MOGHIMI Windows CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Download and verify official sing-box core
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $engineDir = Join-Path $PWD 'src/MixMoghimi/Assets/engine'
+          New-Item -ItemType Directory -Force -Path $engineDir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP 'sing-box-win64.zip'
+          Invoke-WebRequest -Uri 'https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-windows-amd64.zip' -OutFile $zip
+          $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = '99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df'
+          if ($actual -ne $expected) { throw "sing-box archive SHA256 mismatch: $actual" }
+          $extract = Join-Path $env:RUNNER_TEMP 'sing-box-extract'
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $exe = Get-ChildItem -Path $extract -Filter 'sing-box.exe' -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'sing-box.exe was not found in the official archive.' }
+          Copy-Item $exe.FullName (Join-Path $engineDir 'sing-box.exe') -Force
+          & (Join-Path $engineDir 'sing-box.exe') version
+
+      - name: Download licensed Persian UI font
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = Join-Path $PWD 'src/MixMoghimi/Assets'
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/google/fonts/raw/main/ofl/vazirmatn/Vazirmatn%5Bwght%5D.ttf' -OutFile (Join-Path $assets 'Vazirmatn.ttf')
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/google/fonts/main/ofl/vazirmatn/OFL.txt' -OutFile (Join-Path $assets 'OFL.txt')
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/SagerNet/sing-box/v1.14.4/LICENSE' -OutFile (Join-Path $assets 'sing-box-LICENSE.txt')
+          if ((Get-Item (Join-Path $assets 'Vazirmatn.ttf')).Length -lt 10000) { throw 'Vazirmatn font download is invalid.' }
+
+      - name: Restore dependencies
+        run: dotnet restore tests/MixMoghimi.Tests/MixMoghimi.Tests.csproj
+
+      - name: Build WPF app
+        run: dotnet build src/MixMoghimi/MixMoghimi.csproj -c Release --no-restore
+
+      - name: Run unit tests
+        run: dotnet test tests/MixMoghimi.Tests/MixMoghimi.Tests.csproj -c Release --no-restore --logger "console;verbosity=normal"
+
+      - name: Validate sing-box generated configuration
+        shell: pwsh
+        run: |
+          $cfg = @'
+          {
+            "log": { "level": "warn", "timestamp": true },
+            "dns": {
+              "servers": [{
+                "type": "https", "tag": "remote-doh", "server": "1.1.1.1", "server_port": 443,
+                "path": "/dns-query", "tls": { "enabled": true, "server_name": "cloudflare-dns.com" }, "detour": "proxy"
+              }],
+              "final": "remote-doh", "strategy": "prefer_ipv4"
+            },
+            "inbounds": [{ "type": "mixed", "tag": "local-mixed", "listen": "127.0.0.1", "listen_port": 2080 }],
+            "outbounds": [
+              { "type": "shadowsocks", "tag": "proxy", "server": "198.51.100.44", "server_port": 443, "method": "aes-256-gcm", "password": "fake-test-password" },
+              { "type": "direct", "tag": "direct" }
+            ],
+            "route": { "final": "proxy", "auto_detect_interface": true },
+            "experimental": { "clash_api": { "external_controller": "127.0.0.1:30999", "secret": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "default_mode": "rule" } }
+          }
+          '@
+          $configPath = Join-Path $env:RUNNER_TEMP 'mix-singbox-check.json'
+          Set-Content -Path $configPath -Value $cfg -Encoding utf8
+          & "$PWD/src/MixMoghimi/Assets/engine/sing-box.exe" check -c $configPath
+          if ($LASTEXITCODE -ne 0) { throw 'sing-box rejected the generated configuration template.' }
+
+      - name: Test multiple public Shadowsocks servers end-to-end
+        shell: pwsh
+        continue-on-error: true
+        run: ./scripts/Test-PublicShadowsocks.ps1 -SingBox "$PWD/src/MixMoghimi/Assets/engine/sing-box.exe" -OutputPath "$PWD/artifacts/public-node-tests.json" -PassedConfigsPath "$PWD/artifacts/public-test-configs.json"
+
+      - name: Publish self-contained x64
+        run: dotnet publish src/MixMoghimi/MixMoghimi.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o artifacts/MIX-MOGHIMI-win-x64
+
+      - name: Bundle engine and licenses
+        shell: pwsh
+        run: |
+          $engine = Join-Path $PWD 'artifacts/MIX-MOGHIMI-win-x64/engine'
+          New-Item -ItemType Directory -Force -Path $engine | Out-Null
+          Copy-Item 'src/MixMoghimi/Assets/engine/sing-box.exe' (Join-Path $engine 'sing-box.exe') -Force
+          Copy-Item 'src/MixMoghimi/Assets/Vazirmatn.ttf' (Join-Path $PWD 'artifacts/MIX-MOGHIMI-win-x64/Vazirmatn.ttf') -Force
+          Copy-Item 'src/MixMoghimi/Assets/OFL.txt' (Join-Path $PWD 'artifacts/MIX-MOGHIMI-win-x64/Vazirmatn-OFL.txt') -Force
+          Copy-Item 'src/MixMoghimi/Assets/sing-box-LICENSE.txt' (Join-Path $PWD 'artifacts/MIX-MOGHIMI-win-x64/sing-box-LICENSE.txt') -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path $compiler)) {
+            choco install innosetup --yes --no-progress
+          }
+          if (-not (Test-Path $compiler)) { throw 'Inno Setup compiler not found after installation.' }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          & $compiler 'installer/MIX-MOGHIMI.iss'
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed to compile the installer.' }
+          if (-not (Test-Path 'artifacts/MIX-MOGHIMI-Setup-x64.exe')) { throw 'Installer output is missing.' }
+
+      - name: Smoke test installer metadata
+        shell: pwsh
+        run: |
+          $setup = Get-Item 'artifacts/MIX-MOGHIMI-Setup-x64.exe'
+          if ($setup.Length -lt 50000000) { throw 'Setup file is unexpectedly small; bundled runtime or engine may be missing.' }
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "Setup SHA256: $hash" | Tee-Object -FilePath 'artifacts/installer-sha256.txt'
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIX-MOGHIMI-Setup-x64
+          path: artifacts/MIX-MOGHIMI-Setup-x64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload portable build and connection tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIX-MOGHIMI-Windows-x64-Portable-and-Tests
+          path: |
+            artifacts/MIX-MOGHIMI-win-x64/
+            artifacts/public-node-tests.json
+            artifacts/public-test-configs.json
+            artifacts/installer-sha256.txt
+          if-no-files-found: warn
+          retention-days: 30
