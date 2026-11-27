@@ -1,0 +1,116 @@
+name: Bootstrap MIX-MOGHIMI and build Windows installer
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'bootstrap/MIX-MOGHIMI-source.zip'
+      - '.github/workflows/bootstrap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  restore-and-build:
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Restore complete source tree from the bootstrap archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $PWD 'bootstrap/MIX-MOGHIMI-source.zip'
+          if (-not (Test-Path $archive)) { throw 'Source archive is missing.' }
+          $unpack = Join-Path $env:RUNNER_TEMP 'mix-source'
+          if (Test-Path $unpack) { Remove-Item $unpack -Recurse -Force }
+          Expand-Archive -Path $archive -DestinationPath $unpack -Force
+          Get-ChildItem -LiteralPath $unpack -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $PWD -Recurse -Force
+          }
+          Remove-Item (Join-Path $PWD 'bootstrap') -Recurse -Force
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'build: restore MIX-MOGHIMI source project'
+          git push origin HEAD:main
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build, test and publish application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/Build-Windows.ps1
+
+      - name: Validate sing-box baseline config
+        shell: pwsh
+        run: |
+          $cfg = @'
+          {
+            "log": { "level": "warn", "timestamp": true },
+            "inbounds": [{ "type": "mixed", "tag": "local", "listen": "127.0.0.1", "listen_port": 2080 }],
+            "outbounds": [
+              { "type": "shadowsocks", "tag": "proxy", "server": "198.51.100.44", "server_port": 443, "method": "aes-256-gcm", "password": "fake-test-password" },
+              { "type": "direct", "tag": "direct" }
+            ],
+            "route": { "final": "proxy" }
+          }
+          '@
+          $path = Join-Path $env:RUNNER_TEMP 'mix-check.json'
+          Set-Content $path $cfg -Encoding utf8
+          & "$PWD/src/MixMoghimi/Assets/engine/sing-box.exe" check -c $path
+          if ($LASTEXITCODE -ne 0) { throw 'sing-box rejected the generated configuration.' }
+
+      - name: Test multiple public Shadowsocks nodes
+        shell: pwsh
+        continue-on-error: true
+        run: ./scripts/Test-PublicShadowsocks.ps1 -SingBox "$PWD/src/MixMoghimi/Assets/engine/sing-box.exe" -OutputPath "$PWD/artifacts/public-node-tests.json"
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path $compiler)) { choco install innosetup --yes --no-progress }
+          if (-not (Test-Path $compiler)) { throw 'Inno Setup compiler was not installed.' }
+
+      - name: Build installable EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          & $compiler 'installer/MIX-MOGHIMI.iss'
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
+          $setup = Get-Item 'artifacts/MIX-MOGHIMI-Setup-x64.exe'
+          if ($setup.Length -lt 50000000) { throw 'Installer output is too small.' }
+          (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant() |
+            Set-Content 'artifacts/installer-sha256.txt'
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIX-MOGHIMI-Setup-x64
+          path: artifacts/MIX-MOGHIMI-Setup-x64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload portable build and public-node test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIX-MOGHIMI-Windows-x64-Portable-and-Tests
+          path: |
+            artifacts/MIX-MOGHIMI-win-x64/
+            artifacts/public-node-tests.json
+            artifacts/installer-sha256.txt
+          if-no-files-found: warn
+          retention-days: 30
