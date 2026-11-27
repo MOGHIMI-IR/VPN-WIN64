@@ -8,7 +8,7 @@ namespace MixMoghimi.Services;
 /// <summary>Ensures the sing-box child process is killed automatically if MIX crashes.</summary>
 internal sealed class WindowsKillJob : IDisposable
 {
-    private const int JobObjectExtendedLimitInformation = 9;
+    private const int JobObjectExtendedLimitInformationClass = 9;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
     private readonly SafeFileHandle _handle;
 
@@ -26,7 +26,7 @@ internal sealed class WindowsKillJob : IDisposable
                 LimitFlags = JobObjectLimitKillOnJobClose
             }
         };
-        bool configured = SetInformationJobObject(handle, JobObjectExtendedLimitInformation,
+        bool configured = SetInformationJobObject(handle, JobObjectExtendedLimitInformationClass,
             ref info, (uint)Marshal.SizeOf<JobObjectExtendedLimitInformation>());
         if (!configured)
         {
